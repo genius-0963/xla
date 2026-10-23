@@ -3174,6 +3174,148 @@ ENTRY main {
 }
 
 TEST_F(CanShareOperandBufferWithUserTest,
+       LoopFusionWithDuplicateOperandNonElementwiseOnSecondParamCantAlias) {
+  std::string hlo_str = R"(
+HloModule LoopFusionWithDuplicateOperandNonElementwiseOnSecondParamCantAlias
+
+fused_computation {
+  p0 = f32[2,2] parameter(0)
+  p1 = f32[2,2] parameter(1)
+  reverse = f32[2,2] reverse(p1), dimensions={0,1}
+  ROOT add = f32[2,2] add(p0, reverse)
+}
+
+ENTRY main {
+  param0 = f32[2,2] parameter(0)
+  ROOT fusion = f32[2,2] fusion(param0, param0), kind=kLoop, calls=fused_computation
+}
+)";
+  TF_ASSERT_OK_AND_ASSIGN(auto module, ParseAndReturnVerifiedModule(
+                                           hlo_str, GetModuleConfigForTest()));
+
+  HloInstruction* param0 = FindInstruction(module.get(), "param0");
+  HloInstruction* fusion = FindInstruction(module.get(), "fusion");
+
+  auto dataflow_analysis = RunAnalysis(*module);
+
+  EXPECT_FALSE(dataflow_analysis->CanShareOperandBufferWithUser(
+      param0, {}, fusion, {}, &alias_info_));
+}
+
+TEST_F(CanShareOperandBufferWithUserTest,
+       InPlaceDusFusionWithAliasedBitcastSecondParamCantShareValueBuffer) {
+  absl::string_view hlo_str = R"(
+HloModule InPlaceDusFusionWithAliasedBitcastSecondParamCantShareValueBuffer
+
+fused_computation {
+  p0 = f32[8] parameter(0)
+  p1 = f32[8] parameter(1)
+  p2 = s32[] parameter(2)
+  rev = f32[8] reverse(p1), dimensions={0}
+  slice = f32[3] slice(rev), slice={[0:3]}
+  ROOT dus = f32[8] dynamic-update-slice(p0, slice, p2)
+}
+
+ENTRY main {
+  param0 = f32[8] parameter(0)
+  bc = f32[8] bitcast(param0)
+  starts = s32[] constant(2)
+  ROOT fusion = f32[8] fusion(param0, bc, starts), kind=kLoop,
+      calls=fused_computation
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_str));
+
+  HloInstruction* param0 = FindInstruction(module.get(), "param0");
+  HloInstruction* bc = FindInstruction(module.get(), "bc");
+  HloInstruction* fusion = FindInstruction(module.get(), "fusion");
+
+  std::unique_ptr<HloDataflowAnalysis> dataflow_analysis = RunAnalysis(*module);
+
+  EXPECT_FALSE(dataflow_analysis->CanShareOperandBufferWithUser(
+      bc, {}, fusion, {}, &alias_info_));
+  EXPECT_FALSE(dataflow_analysis->CanShareOperandValueBufferWithUser(
+      dataflow_analysis->GetValueDefinedAt(param0), fusion, {}, &alias_info_));
+}
+
+TEST_F(CanShareOperandBufferWithUserTest,
+       InPlaceDusFusionWithDuplicateOperandNonElementwiseCantAlias) {
+  absl::string_view hlo_str = R"(
+HloModule InPlaceDusFusionWithDuplicateOperandNonElementwiseCantAlias
+
+fused_computation {
+  p0 = f32[8] parameter(0)
+  p1 = f32[8] parameter(1)
+  p2 = s32[] parameter(2)
+  rev = f32[8] reverse(p1), dimensions={0}
+  slice = f32[3] slice(rev), slice={[0:3]}
+  ROOT dus = f32[8] dynamic-update-slice(p0, slice, p2)
+}
+
+ENTRY main {
+  param0 = f32[8] parameter(0)
+  starts = s32[] constant(2)
+  ROOT fusion = f32[8] fusion(param0, param0, starts), kind=kLoop,
+      calls=fused_computation
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_str));
+
+  HloInstruction* param0 = FindInstruction(module.get(), "param0");
+  HloInstruction* fusion = FindInstruction(module.get(), "fusion");
+
+  std::unique_ptr<HloDataflowAnalysis> dataflow_analysis = RunAnalysis(*module);
+
+  EXPECT_FALSE(dataflow_analysis->CanShareOperandBufferWithUser(
+      param0, {}, fusion, {}, &alias_info_));
+  EXPECT_FALSE(dataflow_analysis->CanShareOperandValueBufferWithUser(
+      dataflow_analysis->GetValueDefinedAt(param0), fusion, {}, &alias_info_));
+}
+
+TEST_F(CanShareOperandBufferWithUserTest,
+       InPlaceCollectivePermuteStartDuplicateOperandRequiresDisjointRegions) {
+  absl::string_view hlo_str = R"(
+HloModule InPlaceCollectivePermuteStartDuplicateOperand, replica_count=2
+
+ENTRY main {
+  buf0 = f32[128,128]{1,0} parameter(0)
+  buf1 = f32[128,128]{1,0} parameter(1)
+  zero = s32[] constant(0)
+  sixty_four = s32[] constant(64)
+  read_offset = (s32[], s32[]) tuple(zero, zero)
+  write_offset = (s32[], s32[]) tuple(sixty_four, zero)
+  cp_no_attr = (f32[128,128]{1,0}, f32[128,128]{1,0}, u32[], u32[])
+      collective-permute-start(buf0, buf0, read_offset, write_offset),
+      channel_id=1, source_target_pairs={{0,1}}, slice_sizes={{64,128}}
+  done0 = f32[128,128]{1,0} collective-permute-done(cp_no_attr)
+  cp_disjoint = (f32[128,128]{1,0}, f32[128,128]{1,0}, u32[], u32[])
+      collective-permute-start(buf1, buf1, read_offset, write_offset),
+      channel_id=2, source_target_pairs={{0,1}}, slice_sizes={{64,128}},
+      frontend_attributes={xla_disjoint_read_write_regions="true"}
+  done1 = f32[128,128]{1,0} collective-permute-done(cp_disjoint)
+  ROOT out = (f32[128,128]{1,0}, f32[128,128]{1,0}) tuple(done0, done1)
+}
+)";
+  HloModuleConfig config = GetModuleConfigForTest(/*replica_count=*/2);
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(hlo_str, config));
+
+  HloInstruction* buf0 = FindInstruction(module.get(), "buf0");
+  HloInstruction* buf1 = FindInstruction(module.get(), "buf1");
+  HloInstruction* cp_no_attr = FindInstruction(module.get(), "cp_no_attr");
+  HloInstruction* cp_disjoint = FindInstruction(module.get(), "cp_disjoint");
+
+  std::unique_ptr<HloDataflowAnalysis> dataflow_analysis = RunAnalysis(*module);
+
+  EXPECT_FALSE(dataflow_analysis->CanShareOperandBufferWithUser(
+      buf0, {}, cp_no_attr, {1}, &alias_info_));
+  EXPECT_TRUE(dataflow_analysis->CanShareOperandBufferWithUser(
+      buf1, {}, cp_disjoint, {1}, &alias_info_));
+}
+
+TEST_F(CanShareOperandBufferWithUserTest,
        MultiOutputFusionCanAliasOperandBuffer) {
   std::string hlo_str = R"(
 HloModule MultiOutputFusionCanAliasOperandBuffer

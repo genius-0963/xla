@@ -38,6 +38,7 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "tsl/platform/platform.h"
+#include "xla/frontend_attributes.h"
 #include "xla/hlo/analysis/alias_info.h"
 #include "xla/hlo/analysis/hlo_operand_index.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
@@ -86,6 +87,23 @@ bool IsCrossBufferSliceFusion(const HloInstruction* instruction) {
     root = root->operand(1);
   }
   return root->IsCustomFusion();
+}
+
+// Returns true if `instruction` (or an enclosing kWhile instruction) is
+// annotated as reading and writing disjoint buffer regions.
+bool HasDisjointReadWriteRegions(const HloInstruction* instruction) {
+  if (HasDisjointReadWriteRegionsAttr(instruction)) {
+    return true;
+  }
+  if (instruction->parent() != nullptr) {
+    for (const HloInstruction* caller :
+         instruction->parent()->caller_instructions(HloOpcode::kWhile)) {
+      if (HasDisjointReadWriteRegionsAttr(caller)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 // Returns true if the async op `async_op` wraps an op whose loop-carried async
@@ -1997,21 +2015,9 @@ bool HloDataflowAnalysis::CanShareOperandBufferWithUser(
   // Check that operand and user emit the same shape and layout.
   if (shapes_equal) {
     // Must-alias relationship returns true for in-place operations (DUS and DUS
-    // fusions), regardless of the backend.
-    // Cache uses of value and alias_info->GetInPlaceInputOutputPairs to speed
-    // up repeated calls.
-    auto [operand_it, operand_inserted] =
-        cache_share_buffer_with_operand_.try_emplace(
-            std::make_pair(operand, operand_index),
-            absl::flat_hash_set<HloUse>());
-    if (operand_inserted) {
-      // Iterate over all values in the value set since pipelining or loop
-      // crossing can introduce multiple values.
-      for (const HloValue* val : GetValueSet(operand, operand_index).values()) {
-        auto uses = val->GetUses();
-        operand_it->second.insert(uses.begin(), uses.end());
-      }
-    }
+    // fusions), regardless of the backend, provided `operand` is not also read
+    // through another operand position (unless disjoint read/write regions are
+    // guaranteed).
     auto [user_it, user_inserted] = cache_share_buffer_with_user_.try_emplace(
         user, absl::flat_hash_map<ShapeIndex, std::vector<HloOperandIndex>>());
     if (user_inserted) {
@@ -2022,13 +2028,14 @@ bool HloDataflowAnalysis::CanShareOperandBufferWithUser(
             operand_and_output_index.first);
       }
     }
-    auto& uses = operand_it->second;
-    auto& user_pairs = user_it->second;
+    const auto& user_pairs = user_it->second;
     auto pairs_it = user_pairs.find(user_index);
     if (pairs_it != user_pairs.end()) {
-      for (const auto& operand_index : pairs_it->second) {
-        if (uses.contains(HloUse{user, operand_index.operand_number,
-                                 operand_index.operand_index})) {
+      for (const HloOperandIndex& in_place_operand : pairs_it->second) {
+        if (user->operand(in_place_operand.operand_number) == operand &&
+            in_place_operand.operand_index == operand_index &&
+            (user->OperandIndices(operand).size() == 1 ||
+             HasDisjointReadWriteRegions(user))) {
           return true;
         }
       }
@@ -2045,18 +2052,24 @@ bool HloDataflowAnalysis::CanShareOperandBufferWithUser(
   }
 
   if (user->opcode() == HloOpcode::kFusion) {
-    HloInstruction* fusion_param =
-        user->fused_parameter(user->operand_index(operand));
-    const HloValue& fusion_param_value =
-        GetValueDefinedAt(fusion_param, operand_index);
-
     if (user->IsLoopFusion() || user->IsInputFusion()) {
-      return AreTransitiveUsesElementwiseOrTuple(fusion_param);
+      return absl::c_all_of(user->OperandIndices(operand),
+                            [&](int64_t operand_number) {
+                              return AreTransitiveUsesElementwiseOrTuple(
+                                  user->fused_parameter(operand_number));
+                            });
     }
 
     if (user->IsOutputFusion() &&
         user->fused_expression_root()->opcode() == HloOpcode::kAdd) {
       // Output fusion with kAdd fused root.
+      const auto operand_indices = user->OperandIndices(operand);
+      if (operand_indices.size() != 1) {
+        return false;
+      }
+      HloInstruction* fusion_param = user->fused_parameter(operand_indices[0]);
+      const HloValue& fusion_param_value =
+          GetValueDefinedAt(fusion_param, operand_index);
 
       // Check if one operand of kAdd fused root is kDot or kConvolution.
       auto* add = user->fused_expression_root();
@@ -2153,7 +2166,28 @@ bool HloDataflowAnalysis::CanShareOperandBufferWithUser(
 
   // Loop fusions that contain transposing copies won't reach here as they have
   // different layouts, which fails the check in the beginning of this function.
-  return user->IsElementwiseOnOperand(user->operand_index(operand));
+  return absl::c_all_of(user->OperandIndices(operand),
+                        [&](int64_t operand_number) {
+                          return user->IsElementwiseOnOperand(operand_number);
+                        });
+}
+
+bool HloDataflowAnalysis::CanShareOperandValueBufferWithUser(
+    const HloValue& operand_value, HloInstruction* user,
+    const ShapeIndex& user_index, const AliasInfo* alias_info) const {
+  bool used_by_user = false;
+  for (const HloUse& use : operand_value.GetUses()) {
+    if (use.instruction != user) {
+      continue;
+    }
+    if (!CanShareOperandBufferWithUser(
+            user->mutable_operand(use.operand_number), use.operand_index, user,
+            user_index, alias_info)) {
+      return false;
+    }
+    used_by_user = true;
+  }
+  return used_by_user;
 }
 
 absl::Status HloDataflowPropagation::ForEachCallBoundaryWithStatus(

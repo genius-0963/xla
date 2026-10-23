@@ -84,8 +84,10 @@ std::optional<bool> FusionCanShareBufferHint(
   // being on this path).
   // In addition to that, we can also share the buffer for Scatter fusions if
   // the scatter is the single output of the fusion.
-  HloInstruction* fusion_param =
-      user->fused_parameter(user->operand_index(operand));
+  // If 'operand' is passed to the fusion several times, all the corresponding
+  // fusion parameters read the same buffer, so we have to check the paths from
+  // all of them. This is the same as checking a single fusion parameter with
+  // the users of all of them.
   HloInstruction* output = user->fused_expression_root();
   for (int64_t index : user_index) {
     if (output->opcode() != HloOpcode::kTuple) {
@@ -99,9 +101,13 @@ std::optional<bool> FusionCanShareBufferHint(
   }
   std::queue<HloInstruction*> q;
   absl::flat_hash_set<HloInstruction*> visited;
-  q.push(fusion_param);
-  visited.insert(fusion_param);
+  for (int64_t operand_number : user->OperandIndices(operand)) {
+    HloInstruction* fusion_param = user->fused_parameter(operand_number);
+    q.push(fusion_param);
+    visited.insert(fusion_param);
+  }
   bool found_path_to_output = false;
+  bool saw_matching_ds = false;
   while (!q.empty()) {
     HloInstruction* hlo_operand = q.front();
     q.pop();
@@ -126,6 +132,10 @@ std::optional<bool> FusionCanShareBufferHint(
             hlo->shape().IsTuple() ? hlo->shape().tuple_shapes().size() : 1;
         if (hlo->operand_index(hlo_operand) < num_scatter_inputs &&
             absl::c_count(hlo->operands(), hlo_operand) == 1) {
+          if (hlo->shape().IsTuple() &&
+              user_index != ShapeIndex{hlo->operand_index(hlo_operand)}) {
+            return false;
+          }
           continue;
         }
       }
@@ -159,25 +169,28 @@ std::optional<bool> FusionCanShareBufferHint(
             }
           }
         }
-      } else if ((!hlo->IsElementwiseOnOperand(
-                      hlo->operand_index(hlo_operand)) ||
-                  hlo->opcode() == HloOpcode::kCopy) &&
-                 hlo->opcode() != HloOpcode::kBitcast &&
-                 hlo->opcode() != HloOpcode::kTuple && hlo != reduction_hero) {
-        // This check also catches the case that we reach a different fusion
-        // output, as that fusion output would have a tuple op as user, which we
-        // do not allow here.
-        // Even if 'hlo' is not elementwise on the operand, it is ok if we are
-        // coming from the second operand and 'hlo' is a DynamicUpdateSlice
-        // which is the non_bitcast_root. This corresponds to the special case
-        // above, where we allow a DynamicSlice if it accesses the exact same
-        // slice than the DynamicUpdateSlice. When we are coming from the first
-        // operand, IsElementwiseOnOperand() will return true for a
-        // DynamicUpdateSlice.
-        if (hlo != non_bitcast_root ||
-            hlo->opcode() != HloOpcode::kDynamicUpdateSlice ||
-            hlo->operand_index(hlo_operand) != 1) {
-          return false;
+        saw_matching_ds = true;
+      } else {
+        for (int64_t op_idx : hlo->OperandIndices(hlo_operand)) {
+          if ((!hlo->IsElementwiseOnOperand(op_idx) ||
+               hlo->opcode() == HloOpcode::kCopy) &&
+              hlo->opcode() != HloOpcode::kBitcast &&
+              hlo->opcode() != HloOpcode::kTuple && hlo != reduction_hero) {
+            // This check also catches the case that we reach a different fusion
+            // output, as that fusion output would have a tuple op as user,
+            // which we do not allow here.
+            // Even if 'hlo' is not elementwise on the operand, it is ok if we
+            // are coming from the second operand after visiting a matching
+            // DynamicSlice and 'hlo' is a DynamicUpdateSlice which is the
+            // non_bitcast_root. When we are coming from the first operand,
+            // IsElementwiseOnOperand() will return true for a
+            // DynamicUpdateSlice.
+            if (!saw_matching_ds || hlo != non_bitcast_root ||
+                hlo->opcode() != HloOpcode::kDynamicUpdateSlice ||
+                op_idx != 1) {
+              return false;
+            }
+          }
         }
       }
     }
@@ -187,12 +200,21 @@ std::optional<bool> FusionCanShareBufferHint(
     // whether that fusion output has the same iteration order. If not, we
     // cannot share.
     bool other_root_was_reached = false;
+    bool reached_other_non_elementwise_root = false;
     bool reached_root_has_transpose_hero = false;
     for (auto [root, hero] :
          llvm::zip(analysis.fusion_roots(), analysis.fusion_heroes())) {
       if (visited.find(&root.instruction()) != visited.end()) {
         if (&root.instruction() != output) {
           other_root_was_reached = true;
+          const HloInstruction* non_bitcast_other_root = &root.instruction();
+          if (non_bitcast_other_root->opcode() == HloOpcode::kBitcast) {
+            non_bitcast_other_root = non_bitcast_other_root->operand(0);
+          }
+          if (non_bitcast_other_root != reduction_hero &&
+              !non_bitcast_other_root->IsElementwise()) {
+            reached_other_non_elementwise_root = true;
+          }
         }
         if (hero.opcode() == HloOpcode::kTranspose ||
             hero.opcode() == HloOpcode::kCopy) {
@@ -207,9 +229,10 @@ std::optional<bool> FusionCanShareBufferHint(
       // Special case: multi-output fusions with Scatter or DynamicUpdateSlice.
       // For Scatter, we currently do not support multi-output fusions anyway,
       // but still handle it here. To be on the safe side, check for
-      // !IsElementwise() instead of checking whether it is Scatter or
-      // DynamicUpdateSlice.
+      // !IsElementwise() on both the target root and any other reached root
+      // (excluding reduction_hero).
       if (!non_bitcast_root->IsElementwise() ||
+          reached_other_non_elementwise_root ||
           reached_root_has_transpose_hero) {
         return false;
       }
