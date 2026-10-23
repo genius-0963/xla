@@ -82,6 +82,53 @@ ENTRY main {
   ExpectOptionalTrue(MayAlias(fusion, fusion->operand(0), {}));
 }
 
+TEST_F(AliasInfoTest, BufferCanBeSharedDuplicateOperandElementwise) {
+  const char* const kModuleString = R"(
+HloModule fusion
+
+fused_computation {
+  param_0.1 = f32[2,3]{1,0} parameter(0)
+  param_1.1 = f32[2,3]{1,0} parameter(1)
+  ROOT add = f32[2,3]{1,0} add(param_0.1, param_1.1)
+}
+
+ENTRY main {
+  param_0 = f32[2,3]{1,0} parameter(0)
+  ROOT fusion = f32[2,3]{1,0} fusion(param_0, param_0), kind=kLoop, calls=fused_computation
+}
+)";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> module,
+                       ParseAndReturnVerifiedModule(kModuleString));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ExpectOptionalTrue(MayAlias(fusion, fusion->operand(0), {}));
+}
+
+TEST_F(AliasInfoTest, BufferCannotBeSharedDuplicateOperandNonElementwise) {
+  // The fusion reads its operand through both parameters, elementwise through
+  // the first one and in reversed order through the second one.
+  const char* const kModuleString = R"(
+HloModule fusion
+
+fused_computation {
+  param_0.1 = f32[2,3]{1,0} parameter(0)
+  param_1.1 = f32[2,3]{1,0} parameter(1)
+  reverse = f32[2,3]{1,0} reverse(param_1.1), dimensions={0,1}
+  ROOT add = f32[2,3]{1,0} add(param_0.1, reverse)
+}
+
+ENTRY main {
+  param_0 = f32[2,3]{1,0} parameter(0)
+  ROOT fusion = f32[2,3]{1,0} fusion(param_0, param_0), kind=kLoop, calls=fused_computation
+}
+)";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> module,
+                       ParseAndReturnVerifiedModule(kModuleString));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(0), {}));
+}
+
 TEST_F(AliasInfoTest, BufferCanBeSharedBitcastedShape) {
   const char* const kModuleString = R"(
 HloModule fusion
@@ -403,6 +450,56 @@ TEST_F(AliasInfoTest, BufferCanBeSharedVariadicScatterFusion) {
   HloInstruction* fusion = module->entry_computation()->root_instruction();
   ExpectOptionalTrue(MayAlias(fusion, fusion->operand(0), {0}));
   ExpectOptionalTrue(MayAlias(fusion, fusion->operand(1), {1}));
+  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(0), {1}));
+  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(1), {0}));
+}
+
+TEST_F(AliasInfoTest,
+       BufferCannotBeSharedVariadicScatterFusionDuplicateFusionOperand) {
+  const char* const kModuleString = R"(
+    HloModule fusion
+
+    add_mul {
+      lhs_0 = s32[] parameter(0)
+      rhs_0 = s32[] parameter(2)
+      add = s32[] add(lhs_0, rhs_0)
+      lhs_1 = s32[] parameter(1)
+      rhs_1 = s32[] parameter(3)
+      mul = s32[] multiply(lhs_1, rhs_1)
+      ROOT tuple = (s32[], s32[]) tuple(add, mul)
+    }
+
+    fused_computation {
+      p0 = s32[3,3] parameter(0)
+      p1 = s32[3,3] parameter(1)
+      p2 = s32[3] parameter(2)
+      p3 = s32[3,2] parameter(3)
+      p4 = s32[3,2] parameter(4)
+      indices = s32[3] add(p2, p2)
+      ROOT scatter = (s32[3,3], s32[3,3]) scatter(p0, p1, indices, p3, p4),
+          to_apply=add_mul,
+          update_window_dims={1},
+          inserted_window_dims={0},
+          scatter_dims_to_operand_dims={0},
+          index_vector_dim=1
+    }
+
+    ENTRY main {
+      parameter0 = s32[3,3] parameter(0)
+      parameter2 = s32[3] parameter(1)
+      parameter3 = s32[3,2] parameter(2)
+      parameter4 = s32[3,2] parameter(3)
+      ROOT fusion = (s32[3,3], s32[3,3]) fusion(
+          parameter0, parameter0, parameter2, parameter3, parameter4),
+          kind=kInput, calls=fused_computation
+    }
+    )";
+
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> module,
+                       ParseAndReturnVerifiedModule(kModuleString));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(0), {0}));
+  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(0), {1}));
 }
 
 TEST_F(AliasInfoTest,
@@ -931,6 +1028,58 @@ ENTRY main {
                        ParseAndReturnVerifiedModule(kModuleString));
   HloInstruction* fusion = module->entry_computation()->root_instruction();
   ExpectOptionalFalse(MayAlias(fusion, fusion->operand(1), {1, 0}));
+}
+
+TEST_F(AliasInfoTest, BufferCannotBeSharedWhenDusUsesSameParamAsBaseAndUpdate) {
+  const char* const kModuleString = R"(
+HloModule fusion
+
+fused_computation {
+  p0 = s32[2,3]{1,0} parameter(0)
+  zero = s32[] constant(0)
+  ROOT dus = s32[2,3]{1,0} dynamic-update-slice(p0, p0, zero, zero)
+}
+
+ENTRY main {
+  param_0 = s32[2,3]{1,0} parameter(0)
+  ROOT fusion = s32[2,3]{1,0} fusion(param_0), kind=kInput,
+      calls=fused_computation
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> module,
+                       ParseAndReturnVerifiedModule(kModuleString));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(0), {}));
+}
+
+TEST_F(AliasInfoTest,
+       BufferCannotBeSharedMultiOutputFusionReachingOtherNonElementwiseRoot) {
+  const char* const kModuleString = R"(
+HloModule fusion
+
+fused_computation {
+  p0 = s32[2,3]{1,0} parameter(0)
+  p1 = s32[1,2]{1,0} parameter(1)
+  p2 = s32[] parameter(2)
+  zero = s32[] constant(0)
+  dus = s32[2,3]{1,0} dynamic-update-slice(p0, p1, p2, zero)
+  neg = s32[2,3]{1,0} negate(p0)
+  ROOT output = (s32[2,3]{1,0}, s32[2,3]{1,0}) tuple(dus, neg)
+}
+
+ENTRY main {
+  param_0 = s32[2,3]{1,0} parameter(0)
+  param_1 = s32[1,2]{1,0} parameter(1)
+  param_2 = s32[] parameter(2)
+  ROOT fusion = (s32[2,3]{1,0}, s32[2,3]{1,0}) fusion(
+      param_0, param_1, param_2), kind=kInput, calls=fused_computation
+}
+)";
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<xla::HloModule> module,
+                       ParseAndReturnVerifiedModule(kModuleString));
+  HloInstruction* fusion = module->entry_computation()->root_instruction();
+  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(0), {0}));
+  ExpectOptionalFalse(MayAlias(fusion, fusion->operand(0), {1}));
 }
 
 }  // namespace
