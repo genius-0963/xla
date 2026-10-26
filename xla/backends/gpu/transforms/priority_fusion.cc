@@ -115,6 +115,51 @@ bool AllScansHaveDimSizeAtMost(const HloInstruction& instr, int64_t max_size) {
   return true;
 }
 
+bool IsCheapProducerOp(const HloInstruction& instr) {
+  switch (instr.opcode()) {
+    case HloOpcode::kConstant:
+    case HloOpcode::kParameter:
+      return ShapeUtil::IsScalar(instr.shape());
+    case HloOpcode::kIota:
+      return true;
+    case HloOpcode::kBroadcast:
+      return ShapeUtil::IsScalar(instr.operand(0)->shape());
+    default:
+      return instr.IsElementwise();
+  }
+}
+
+// Returns true if `producer` computes its output from only scalar operands,
+// scalar constants, iotas, broadcasts of scalars, and elementwise ops.
+bool IsCheapNoMemoryProducer(const HloInstruction& producer) {
+  absl::flat_hash_set<const HloInstruction*> visited;
+  std::vector<const HloInstruction*> worklist = {&producer};
+  while (!worklist.empty()) {
+    const HloInstruction* instr = worklist.back();
+    worklist.pop_back();
+    if (!visited.insert(instr).second) {
+      continue;
+    }
+    if (instr->opcode() == HloOpcode::kFusion) {
+      if (!absl::c_all_of(
+              instr->fused_instructions_computation()->instructions(),
+              [](const HloInstruction* fused) {
+                return IsCheapProducerOp(*fused);
+              })) {
+        return false;
+      }
+    } else if (!IsCheapProducerOp(*instr)) {
+      return false;
+    }
+    for (const HloInstruction* operand : instr->operands()) {
+      if (!ShapeUtil::IsScalar(operand->shape())) {
+        worklist.push_back(operand);
+      }
+    }
+  }
+  return true;
+}
+
 // Bitcasts are fusible if they don't change the bit width.
 bool IsFusibleBitcast(const HloInstruction& instr) {
   return instr.opcode() == HloOpcode::kBitcast &&
@@ -926,7 +971,8 @@ class PriorityFusionQueue {
         return FusionDecision::Forbid(
             "producer fusion into a non-Triton scan fusion is not supported");
       }
-      if (!AllScansHaveDimSizeAtMost(*consumer, kMaxRowLocalScanDimSize)) {
+      if (!AllScansHaveDimSizeAtMost(*consumer, kMaxRowLocalScanDimSize) &&
+          !IsCheapNoMemoryProducer(*producer)) {
         return FusionDecision::Forbid(
             absl::StrCat("producer fusion into scan fusions with a scan "
                          "dimension > ",
